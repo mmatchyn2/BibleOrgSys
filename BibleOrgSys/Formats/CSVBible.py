@@ -52,6 +52,7 @@ CHANGELOG:
     2025-09-27 Added (exported) BibleHub TSV spreadsheet/table format
     2025-11-20 Added our wordtables for BibleHub TSV spreadsheet/table format
     2026-02-03 Updated for changes in BibleHub TSV spreadsheet format with improved column names
+    2026-08-29 Speed up Berean loads when only a few books are specified to be loaded
 """
 from pathlib import Path
 import logging
@@ -67,10 +68,10 @@ from BibleOrgSys.OriginalLanguages import Hebrew, Greek
 import bos_books_codes_py
 
 
-LAST_MODIFIED_DATE = '2026-04-26' # by RJH
+LAST_MODIFIED_DATE = '2026-08-29' # by RJH
 SHORT_PROGRAM_NAME = "CSVBible"
 PROGRAM_NAME = "CSV Bible format handler"
-PROGRAM_VERSION = '0.50'
+PROGRAM_VERSION = '0.60'
 PROGRAM_NAME_VERSION = f'{SHORT_PROGRAM_NAME} v{PROGRAM_VERSION}'
 
 DEBUGGING_THIS_MODULE = False
@@ -267,6 +268,7 @@ class CSVBible( Bible ):
                             break
                 else: # no files found
                     logging.critical( _(f"CSVBible: Unable to discover a single filename in {self.sourceFolder}") )
+        self.specifiedBooks = None
     # end of CSVBible.__init__
 
 
@@ -501,6 +503,7 @@ class CSVBible( Bible ):
 
         fnPrint( DEBUGGING_THIS_MODULE, f"CSVBible._loadBereanSpreadsheetTable( {filepath} )")
         vPrint( 'Info', DEBUGGING_THIS_MODULE, f"  Loading Berean word table from {filepath}…" )
+        filepath = Path( filepath ) if not isinstance( filepath, Path ) else filepath # Ensure we have a Path
 
         WORD_TABLE_FILENAMES = ('OET-LV_OT_word_table.tsv', 'OET-LV_NT_word_table.tsv')
         self.ESFMWordTables, self.ESFMColumnNameList = {}, {}
@@ -538,9 +541,20 @@ class CSVBible( Bible ):
             """
             fnPrint( DEBUGGING_THIS_MODULE, f"CSVBible._loadBereanSpreadsheetTable._loadPossibleWordTables( {folderpath} )")
 
+            # Only load the word tables we actually need for the requested books.
+            #   (If no books are specified, we need both testaments.)
+            if self.specifiedBooks:
+                needOT = any( bos_books_codes_py.is_old_testament_nr( BBB ) for BBB in self.specifiedBooks )
+                needNT = any( bos_books_codes_py.is_new_testament_nr( BBB ) for BBB in self.specifiedBooks )
+                neededFilenames = [filename for filename in WORD_TABLE_FILENAMES
+                                   if ('_OT_' in filename and needOT) or ('_NT_' in filename and needNT)]
+                vPrint( 'Normal', DEBUGGING_THIS_MODULE, f"_loadPossibleWordTables: Only loading {neededFilenames} because {self.specifiedBooks=}" )
+            else:
+                neededFilenames = WORD_TABLE_FILENAMES
+
             # loadedWordTable = []
             self.abbreviatedWordTables = {}
-            for filename in WORD_TABLE_FILENAMES:
+            for filename in neededFilenames:
                 filepath = folderpath.joinpath( filename )
                 print( f"_loadPossibleWordTables looking for {filepath}…" )
                 with open(filepath, 'rt', encoding='utf-8') as wordFile:
@@ -581,9 +595,9 @@ class CSVBible( Bible ):
         # end of _loadBereanSpreadsheetTable._loadPossibleWordTables
 
         _loadPossibleWordTables( filepath.parent )
-        # Make a BCV index to the word tables
+        # Make a BCV index to the word tables (only for the tables we loaded)
         word_table_indexes = {}
-        for wordTableFilename in WORD_TABLE_FILENAMES:
+        for wordTableFilename in self.ESFMWordTables:
             word_table_indexes[wordTableFilename] = {}
             lastBCVref = None
             startIx = 1
@@ -795,31 +809,25 @@ class CSVBible( Bible ):
         wordBSBOffset = 0 # Used to calculate word numbers within a verse
         fgRef = C = V = vStr = None
         wJ = qs = False
+        currentBBB = None
+        skipCurrentBook = False # True while a row belongs to a book that was NOT requested
         dict_reader = DictReader( tsv_lines, delimiter='\t' )
         for n, row in enumerate( dict_reader, start=1 ):
             # if fgRef and fgRef.startswith( 'GEN_1:' ):
             # print( f"\n{n}: {row}" )
             # if fgRef == 'GEN_1:2': assert False, "We want to stop here"
 
-            try: # BSB
-                if row['WLC / Nestle Base TR RP WH NE NA SBL']:
-                    originalLanguageWord = row['WLC / Nestle Base TR RP WH NE NA SBL'].replace('׃','')
-                else: # it's one of those nine blank rows between each verse
-                    try: wordBSBOffset = int( row['Heb Sort' if isOT else 'Greek Sort'] ) #+ (1 if isNT else 0)
-                    except ValueError: wordBSBOffset = int( float( row['Heb Sort' if isOT else 'Greek Sort'] ) )
-            except KeyError: # Must be MSB NT
-                if row['MT']:
-                    originalLanguageWord = row['MT']
-                else: # it's one of those nine blank rows between each verse
-                    wordBSBOffset = int( row['Greek Sort'] )
-
-            if qs and thisVerseText: # Close the last verse
-                # thisBook.appendToLastLine( '\\qs*' )
-                thisVerseText = f'{thisVerseText}\\qs*'
-                qs = False
-
             # BibleHub improved some column names around December 2025
             verseIdColumnName, openQuoteColumnName, closeQuoteColumnName = ('VerseId','begQ','endQ') if ' BSB version ' in row else ('Verse','“','”')
+
+            if skipCurrentBook and not row[verseIdColumnName]:
+                # Skip content rows belonging to a book that wasn't requested ...
+                if row.get( ' BSB version ' ) or row.get( 'MSB' ) or row.get( 'Hdg' ) \
+                   or row.get( 'Par' ) or row.get( 'Crossref' ):
+                    continue
+                # ... but still process the cheap blank (placeholder) rows so that the
+                #    running wordBSBOffset stays correct for the next requested book.
+                #    (Falls through to the per-word try block below which just updates wordBSBOffset.)
 
             if row[verseIdColumnName]: # Occurs on the first word in the verse
                 if vStr: # Write the last verse number
@@ -836,7 +844,19 @@ class CSVBible( Bible ):
                 C, V = CV.split( ':', 1 )
                 vStr = V # Tells us that we need to print it
                 BBB = bos_books_codes_py.english_name_to_bos_book_code( bookName )
-                # print( f"  {BBB} {C}:{V}")
+                if self.specifiedBooks and BBB not in self.specifiedBooks:
+                    skipCurrentBook = True # Skip every row for this non-requested book (incl. its word rows above)
+                    currentBBB = BBB
+                    # Remember this book's testament so we can keep maintaining wordBSBOffset
+                    #   from its cheap blank (placeholder) rows as we skip past it.
+                    isOT = bos_books_codes_py.is_old_testament_nr( BBB )
+                    isNT = bos_books_codes_py.is_new_testament_nr( BBB )
+                    vStr = None # Don't carry any pending verse over from a book we're skipping
+                    continue # Only load the requested books
+                skipCurrentBook = False
+                currentBBB = BBB
+
+                # print( f"  {BBB} {C}:{V} with {self.specifiedBooks=}")
                 assert BBB, f"{n} {row[verseIdColumnName]=}"
                 fgRef = f'{BBB}_{C}:{V}'
                 if fgRef == 'MAT_1:1': wordBSBOffset = 0 # Special case for start of NT
@@ -878,6 +898,30 @@ class CSVBible( Bible ):
                     addLine( 'c', C, fgRef, thisBook )
                     lastChapterNumber = chapterNumber
                     lastVerseNumber = -1
+            elif skipCurrentBook:
+                # Content rows of a non-requested book were already skipped at the top.
+                #    A pure blank (placeholder) row reaching here only updates wordBSBOffset.
+                if row.get( 'footnotes' ) or row.get( 'End text' ):
+                    continue # residual content on a non-requested book's word row
+                else:
+                    pass # let the blank row fall through to maintain wordBSBOffset
+
+            try: # BSB
+                if row['WLC / Nestle Base TR RP WH NE NA SBL']:
+                    originalLanguageWord = row['WLC / Nestle Base TR RP WH NE NA SBL'].replace('׃','')
+                else: # it's one of those nine blank rows between each verse
+                    try: wordBSBOffset = int( row['Heb Sort' if isOT else 'Greek Sort'] ) #+ (1 if isNT else 0)
+                    except ValueError: wordBSBOffset = int( float( row['Heb Sort' if isOT else 'Greek Sort'] ) )
+            except KeyError: # Must be MSB NT
+                if row['MT']:
+                    originalLanguageWord = row['MT']
+                else: # it's one of those nine blank rows between each verse
+                    wordBSBOffset = int( row['Greek Sort'] )
+
+            if qs and thisVerseText: # Close the last verse
+                # thisBook.appendToLastLine( '\\qs*' )
+                thisVerseText = f'{thisVerseText}\\qs*'
+                qs = False
 
             if row['Hdg']:
                 # print( f"  {n} {row['Hdg']=}" )
@@ -1054,7 +1098,7 @@ class CSVBible( Bible ):
                                 #  'MAT_7:20','MAT_12:48','MAT_17:22','MAT_17:26','MAT_18:12','MAT_23:15',
                                 #  'MRK_1:14','MRK_3:4','MRK_7:17','MRK_9:8','MRK_9:45','MRK_9:47','MRK_10:24',
                                 #  'LUK_2:48','ACT_8:38','ROM_16:25','GAL_1:1'):
-                    assert wordNumberInVerse >= 1, f"From {fgRef} {thisSortNumber=} ({wordBSBOffset=}) got {wordNumberInVerse=} for {original_text=}"
+                    assert wordNumberInVerse >= 1, f"From {fgRef} {thisSortNumber=} ({wordBSBOffset=}) got {wordNumberInVerse=} for {row[' BSB version ']=}"
 
                 original_text = ( row[' BSB version ']
                                     # I just guessed at these BSB fixes, so they really need checking out properly
@@ -1251,7 +1295,7 @@ class CSVBible( Bible ):
     # end of CSVBible.load
 
 
-    def loadBooks( self ):
+    def _loadBooks( self ):
         """
         Assumes self.sourceFilepath is not set
             (If not, use load() instead.)
@@ -1285,7 +1329,32 @@ class CSVBible( Bible ):
                 self.stashBook( tempBookStore[BBB] )
 
         self.doPostLoadProcessing()
+    # end of VPLBible._loadBooks
+
+
+    def loadBooks( self ):
+        """
+        Assumes self.sourceFilepath is not set
+            (If not, use load() instead.)
+
+        Finds and loads multiple source files and load book elements.
+        """
+        self.specifiedBooks = None
+        return self._loadBooks()
     # end of VPLBible.loadBooks
+
+
+    def loadSpecifiedBooks( self, desiredBookList ):
+        """
+        Assumes self.sourceFilepath is not set
+            (If not, use load() instead.)
+
+        Finds and loads multiple source files and load book elements.
+        """
+        assert desiredBookList
+        self.specifiedBooks = desiredBookList
+        return self._loadBooks()
+    # end of VPLBible.loadSpecifiedBooks
 # end of CSVBible class
 
 
@@ -1382,6 +1451,84 @@ def briefDemo() -> None:
                 testCSV( someFolder )
 # end of CSVBible.briefDemo
 
+BEREAN_SPREADSHEET_DEMO_BOOKS = ('AMO', 'MRK', 'EPH') # A representative OT + two NT books for the speed test
+
+
+def speedComparisonDemo():
+    """
+    Times loading the whole Berean (BibleHub) spreadsheet word-table Bible versus loading
+    just a few requested books, and verifies that the requested books' verse text matches.
+
+    This only runs if the Berean source data can be found (it's not part of the repo's
+    small test data folders). The expected location is
+    'OpenBibleData/copiedBibles/English/Berean.Bible/BSB' alongside the repo, but we also
+    search a couple of common alternatives so this test is harmless when the data is absent.
+    """
+    import time
+
+    candidateFolders = [
+        Path('/srv/FreelyGiven/OpenBibleData/copiedBibles/English/Berean.Bible/BSB'),
+        Path('OpenBibleData/copiedBibles/English/Berean.Bible/BSB'),
+        BibleOrgSysGlobals.BOS_TEST_DATA_FOLDERPATH.joinpath( 'Berean.Bible/BSB' ),
+    ]
+    bereanFolder = None
+    for candidate in candidateFolders:
+        if candidate.joinpath( 'bsb_tables.tsv' ).is_file():
+            bereanFolder = candidate
+            break
+    if bereanFolder is None:
+        vPrint( 'Info', DEBUGGING_THIS_MODULE,
+                "Skipping the Berean speed-comparison test (couldn't find the BSB spreadsheet data)." )
+        return
+
+    vPrint( 'Normal', DEBUGGING_THIS_MODULE, f"\nSpeed comparison using the full Berean spreadsheet at {bereanFolder}…" )
+
+    # 1. A full load of every book
+    fullVB = CSVBible( bereanFolder, 'bsb_tables', 'BSB' )
+    tStart = time.time()
+    fullVB.load()
+    fullTime = time.time() - tStart
+    vPrint( 'Normal', DEBUGGING_THIS_MODULE, f"    Full load of all {len(fullVB)} books took {fullTime:.2f} s" )
+
+    # 2. A load of only a few requested books
+    fewVB = CSVBible( bereanFolder, 'bsb_tables', 'BSB' )
+    fewVB.specifiedBooks = list( BEREAN_SPREADSHEET_DEMO_BOOKS )
+    tStart = time.time()
+    fewVB.load()
+    fewTime = time.time() - tStart
+    vPrint( 'Normal', DEBUGGING_THIS_MODULE,
+            f"    Load of only {len(fewVB)} book(s) {BEREAN_SPREADSHEET_DEMO_BOOKS} took {fewTime:.2f} s" )
+
+    if fullTime > 0:
+        vPrint( 'Normal', DEBUGGING_THIS_MODULE, f"    => few-books load is {fullTime/fewTime:.1f}x faster than the full load" )
+
+    # 3. Verify the few-books load produces identical verse text to the full load
+    #    for the books that were requested.
+    mismatches = checked = 0
+    for BBB in BEREAN_SPREADSHEET_DEMO_BOOKS:
+        fewBook = fewVB.books.get( BBB )
+        fullBook = fullVB.books.get( BBB )
+        if fewBook is None or fullBook is None:
+            vPrint( 'Normal', DEBUGGING_THIS_MODULE, f"    WARNING: {BBB} missing from one of the loads" )
+            continue
+        versification, *_ = fullBook.getVersification()
+        for chapter, numVerses in versification:
+            for verse in range( 1, int( numVerses ) + 1 ):
+                checked += 1
+                reference = ( BBB, str( chapter ), str( verse ) )
+                fullText = fullVB.getVerseText( reference )
+                fewText = fewVB.getVerseText( reference )
+                if fullText != fewText:
+                    mismatches += 1
+                    if mismatches <= 5:
+                        vPrint( 'Normal', DEBUGGING_THIS_MODULE,
+                                f"    MISMATCH {reference}:\n        full: {fullText!r}\n        few : {fewText!r}" )
+    vPrint( 'Normal', DEBUGGING_THIS_MODULE,
+            f"    Compared {checked:,} verse(s) of {BEREAN_SPREADSHEET_DEMO_BOOKS} between the two loads: {mismatches} mismatch(es)" )
+    assert mismatches == 0, f"{mismatches} verse mismatches between the few-books and full loads!"
+# end of speedComparisonDemo
+
+
 def fullDemo() -> None:
     """
     Full demo to check class is working
@@ -1391,6 +1538,7 @@ def fullDemo() -> None:
     testFolders =  ( BibleOrgSysGlobals.BOS_TEST_DATA_FOLDERPATH.joinpath( 'CSVTest1/'),
                     BibleOrgSysGlobals.BOS_TEST_DATA_FOLDERPATH.joinpath( 'CSVTest2/') )
 
+    speedComparisonDemo() # Compare full-load vs few-books-load timing on the real Berean data (if available)
 
     if 1: # demo the file checking code -- first with the whole folder and then with only one folder
         for testFolder in testFolders:
